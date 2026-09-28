@@ -1,0 +1,16 @@
+# MoE_args
+
+- MoE is actually an implementation of conditional computing
+- expert granularity:d_origin/num_expert   通常我们的专家更多那么效果更好
+
+## 计算量计算
+对于两个矩阵(M,K),(K,N)     
+每个结果中的标量需要2K flops    
+整个结果就需要2KMN flops    
+
+神经网络训练中,一个前向的矩阵乘法需要两个矩阵乘法来进行反向传播     
+所以一共需要6KMN    
+该算式中,KN即为矩阵参数的数量   
+M为num_of_tokens    
+
+所以可以大致估算计算量为6乘token数乘参数数量
