@@ -34,7 +34,7 @@ class DeepSeekV3ModelArgs:
     rope_theta: float = 10000.0
     rope_factor: float = 40.0
     beta_fast: int = 32
-    bate_slow: int = 1
+    beta_slow: int = 1
     mscale: float = 1.0
 
     # compute the flops and parameters
