@@ -64,3 +64,25 @@ $$
 ![alt text](MLA.png)
 
 [结合代码理解](../torchfeather/model/model.py)
+
+### compute
+
+$$
+q^T_{t,i}k^C_{j,i}=(w^Q_ih_t)^T(w_i^{Uk}c^{kv}_j)=[(w_i^{Uk})^Tw^Q_ih_t]^Tc^{kv}_j
+$$
+
+貌似我们要算两个乘法,但是根据上述推导可以直接fuse掉两个矩阵,还是只用算一次(算QK)
+
+$$
+output_t=\sum_i w^o_i o_{t,i}=\sum_i w^o_i \sum_j score_{t,j,i}(w^{Uv}_ic^{kv}_j)=\sum_i w^o_i w^{Uv}_i\sum_j score_{t,j,i}(c^{kv}_j)
+$$
+
+这里还是可以fuse
+所以一旦模型训练完,就可以fuse,基本不增大计算量的同时更能存KV
+
+### about rope
+旋转矩阵的transpose就是inverse,也就是说它的transpose代表往回旋转相同的度数
+
+- why 我们要区分rope和nope
+对于应用了rope旋转的情况,我们的QK的权重矩阵之间有一个rope应用操作导致两个矩阵没办法fuse
+拼接向量的点积等于分量点积之和,我们缓存的时候,rope部分直接缓存已经旋转过的向量,这样就能用上
