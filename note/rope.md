@@ -30,18 +30,16 @@ theta小的时候,波长大,主要是用来区分间隔较远的token
 这有些时候效果还行,但是也有问题,因为它把所有theta都放小了,这样高频减小,模型区分邻近token的能力可能减弱          
 
 ### true yarn
-(L:original seqlen,S:hyper parameter)
+(L:original seqlen,S:hyper parameter)           
+
 $$
-r(d)=\frac{L}{\lambda_D}=\frac{L}{2\pi b^{\frac{2d}{|D|}}}
-$$
-$$
-\gamma(r)=\begin{cases}
+\begin{aligned}
+r(d)&=\frac{L}{\lambda_D}=\frac{L}{2\pi b^{\frac{2d}{|D|}}}\\
+\gamma(r)&=\begin{cases}
 0,& r<\alpha\\
 1,& r>\beta\\
 \frac{r-\alpha}{\beta-\alpha}
-\end{cases}
-$$
-
-$$
-h(\theta_d)=(1-\gamma(r(d)))\frac{\theta_d}{s}+\gamma(r(d))\theta_d
+\end{cases}\\
+h(\theta_d)&=(1-\gamma(r(d)))\frac{\theta_d}{s}+\gamma(r(d))\theta_d
+\end{aligned}
 $$

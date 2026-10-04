@@ -150,7 +150,7 @@ class Attention(nn.Module):
         )
 
         self.wq_abs = nn.Linear(
-            self.num_heads * (self.kv_lora_rank + self.self.qk_rope_head_dim),
+            self.num_heads * (self.kv_lora_rank + self.qk_rope_head_dim),
             self.dim,
             bias=False,
             device=device,
@@ -163,7 +163,7 @@ class Attention(nn.Module):
             self.wo.view(self.dim, self.num_heads, -1).permute(1, 0, 2), w_uv
         )
         wo_abs = wo_head_abs.permute(1, 0, 2).reshape(
-            self.dim, self.num_heads, self.kv_lora_rank
+            self.dim, self.num_heads * self.kv_lora_rank
         )
         self.wo_abs = nn.Linear(
             self.num_heads * self.kv_lora_rank,
