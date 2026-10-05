@@ -140,3 +140,267 @@ class Trainer(Stateful):
         self.gradient_accumulation_steps = global_batch_size // (
             job_config.training.local_batch_size * dp_degree
         )
+        assert self.gradient_accumulation_steps > 0
+
+        # apply parallelism
+        if self.parallel_dims.pp_enabled:
+            (
+                self.pp_schedule,
+                self.model_parts,
+                self.pp_has_first_stage,
+                self.pp_has_last_stage,
+            ) = pipeline_llm(
+                model,
+                self.parallel_dims,
+                job_config,
+                self.device,
+                model_args.n_layers,
+                parallelize_deepseekv3,
+                self.loss_fn,
+            )
+            del model
+            for m in self.model_parts:
+                m.to_empty(device=init_device)
+                with torch.no_grad():
+                    m.init_weights(buffer_device=buffer_device)
+                m.train()
+
+        else:
+            model = parallelize_deepseekv3(model, self.parallel_dims, job_config)
+            model.to_empty(device=init_device)
+            with torch.no_grad():
+                model.init_weights(buffer_device=buffer_device)
+            model.train()
+
+            self.model_parts = [model]
+
+        device_memory_monitor = self.metrics_processor.device_memory_monitor
+        gpu_peak_flops = utils.get_peak_flops(device_memory_monitor.device_name)
+        logger.info(f"Peak FLOPS used for computing MFU: {gpu_peak_flops:.3e}")
+        device_mem_stats = device_memory_monitor.get_peak_stats()
+        logger.info(
+            f"{device_type.upper()} memory usage for model :"
+            f"{device_mem_stats.max_reserved_gib:.2f}GiB"
+            f"({device_mem_stats.max_reserved_pct:.2f}%)"
+        )
+
+        self.optimizers = build_optimizers_with_moe_load_balancing(
+            self.model_parts, job_config.optimizer, self.parallel_dims
+        )
+        self.lr_schedulers = build_lr_schedulers(
+            self.optimizers, job_config.lr_scheduler, job_config.training.steps
+        )
+        self.metrics_processor.optimizers = self.optimizers
+        self.metrics_processor.model_parts = self.model_parts
+
+        self.step = 0
+        self.ntokens_seen = 0
+        self.checkpointer = CheckpointManager(
+            dataloader=self.dataloader,
+            model_parts=self.model_parts,
+            optimizers=self.optimizers,
+            lr_schedulers=self.lr_schedulers,
+            additional_states={"train_state": self},
+            checkpoint_config=job_config.checkpoint,
+            base_folder=job_config.job.dump_folder,
+        )
+        loss_parallel_enabled = (
+            self.parallel_dims.tp_enabled
+            and not parallelism_config.disable_loss_parallel
+        )
+        self.train_context = dist_utils.get_train_context(
+            loss_parallel_enabled, parallelism_config.enable_compiled_autograd
+        )
+        self.maybe_enable_amp = dist_utils.maybe_enable_amp(
+            self.parallel_dims, job_config.training.mixed_precision_param, device_type
+        )
+        logger.info(
+            "Trainer is initialized with "
+            f"local batch size {job_config.training.local_batch_size}, "
+            f"global batch size {global_batch_size}, "
+            f"gradient accumulation steps {self.gradient_accumulation_steps}, "
+            f"sequence length {job_config.training.seq_len}, "
+            f"total steps {job_config.training.steps} "
+            f"(warmup {job_config.lr_scheduler.warmup_steps})"
+        )
+
+    def _create_parallel_dim(
+        self, parallelism_config: Parallelism, world_size: int
+    ) -> ParallelDims:
+        return ParallelDims(
+            dp_shard=parallelism_config.data_parallel_shard_degree,
+            dp_replicate=parallelism_config.data_parallel_replicate_degree,
+            cp=parallelism_config.context_parallel_degree,
+            tp=parallelism_config.tensor_parallel_degree,
+            pp=parallelism_config.pipeline_parallel_degree,
+            ep=parallelism_config.expert_parallel_degree,
+            etp=parallelism_config.expert_tensor_parallel_degree,
+            world_size=world_size,
+        )
+
+    def train_step(
+        self, data_iter: Iterator[tuple[dict[str, torch.tensor], torch.tensor]]
+    ):
+        self.optimizers.zero_grad()
+        lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
+        parallel_dims = self.parallel_dims
+        micro_batches = []
+        local_valid_tokens = torch.tensor(0, dtype=torch.int64, device=self.device)
+        for mb in range(self.gradient_accumulation_steps):
+            input_dict, lable = next(data_iter)
+            # collect the number of valid token means ignore the paddding
+            local_valid_tokens += (lable != IGNORE_INDEX).sum()
+            micro_batches.append((input_dict, lable))
+        local_valid_tokens //= self.parallel_dims.cp
+
+        if parallel_dims.dp_cp_enabled:
+            global_valid_tokens = dist_utils.dist_sum(
+                local_valid_tokens, parallel_dims.get_mesh("loss")
+            )
+        else:
+            global_valid_tokens = local_valid_tokens.float()
+        accumulated_loss = []
+        for input_dict, lable in micro_batches:
+            cur_loss = self.foward_backward_step(input_dict, lable, global_valid_tokens)
+            accumulated_loss.append(cur_loss.detach())
+        # pp run backward on raw sum,other will divide before backward
+        if parallel_dims.pp_enabled:
+            for m in self.model_parts():
+                for params in m.parameters():
+                    if params.grad is not None:
+                        params.grad.div_(global_valid_tokens)
+
+        should_log = self.metrics_processor.should_log(self.step)
+        parameter_metric = (
+            collect_parameter_norm_metrics(
+                self.model_parts, pp_mesh=self.parallel_dims.get_optional_mesh("pp")
+            )
+            if should_log
+            else {}
+        )
+
+        grad_norm = dist_utils.clip_grad_norm_(
+            [p for m in self.model_parts for p in m.parameters()],
+            self.job_config.training.max_norm,
+            foreach=True,
+            pp_mesh=parallel_dims.get_optional_mesh("pp"),
+            ep_enabled=parallel_dims.ep_enabled,
+        )
+        self.optimizers.step()
+        self.lr_schedulers.step()
+
+        loss = torch.sum(torch.stack(accumulated_loss))
+
+        if not should_log:
+            return
+        if parallel_dims.dp_cp_enabled:
+            loss = loss.detach()
+            dp_cp_mesh = parallel_dims.get_mesh("loss")
+            global_avg_loss = dist_utils.dist_sum(loss, dp_cp_mesh)
+            local_avg_loss = loss * global_valid_tokens / local_valid_tokens
+            global_max_loss = dist_utils.dist_max(local_avg_loss, dp_cp_mesh)
+            global_num_tokens_seen = dist_utils.dist_sum(
+                torch.tensor(self.ntokens_seen, dtype=torch.int64, device=self.device),
+                dp_cp_mesh,
+            )
+        else:
+            global_avg_loss = global_max_loss = loss.detach().item()
+            global_num_tokens_seen = self.ntokens_seen
+        extra_metrics = {"n_tokens_seen": global_num_tokens_seen, "lr": lr}
+        extra_metrics.update(parameter_metric)
+        self.metrics_processor.log(
+            self.step,
+            global_avg_loss,
+            global_max_loss,
+            grad_norm.item(),
+            extra_metrics=extra_metrics,
+        )
+
+    @record
+    def train(self):
+        self.checkpointer.load(step=self.job_config.checkpoint.load_step)
+        logger.info(f"Training starts at step {self.step+1}")
+
+        with (
+            maybe_enable_profiling(
+                self.job_config.profiling,
+                global_step=self.step,
+                base_folder=self.job_config.job.dump_folder,
+                leaf_folder="",
+            ) as torch_profiler,
+            maybe_enable_memory_snapshot(
+                self.job_config.profiling,
+                global_step=self.step,
+                base_folder=self.job_config.job.dump_folder,
+                leaf_folder="",
+            ) as memory_profiler,
+        ):
+            data_iter = self.batch_generator(self.dataloader)
+            while self.should_continue_training():
+                self.step += 1
+                self.gc_handler.run(self.step)
+                try:
+                    self.train_step(data_iter)
+                except DataloaderExhaustedError:
+                    logger.warning("Ran out of data; last step was canceled")
+                    break
+                self.checkpointer.save(
+                    self.step, last_step=(self.stepl == self.job_config.training.steps)
+                )
+                if torch_profiler:
+                    torch_profiler.step()
+                if memory_profiler:
+                    memory_profiler.step()
+                if self.step == 1:
+                    dist_utils.set_pg_timeouts(
+                        timeout=timedelta(
+                            seconds=self.job_config.comm.train_timeout_seconds
+                        ),
+                        parallel_dims=self.parallel_dims,
+                    )
+
+                if torch.distributed.get_rank() == 0:
+                    logger.info("Sleeping 2 seconds for other ranks to complete")
+                    time.sleep(2)
+                    logger.info("Training completed")
+
+
+def _arm_successful_shutdown_watchdog(timeout_seconds: int = 30) -> None:
+    logger.info(
+        "Arming post-training shutdown watchdog (SIGALRM) for {} seconds",
+        timeout_seconds,
+    )
+    signal.signal(signal.SIGALRM, signal.SIG_DFL)
+    signal.alarm(timeout_seconds)
+
+
+def _shutdown_after_successful_training(trainer: Trainer) -> None:
+    # Arm the watchdog before any close/destroy work begins so it can cover
+    # WandB/checkpoint cleanup, process-group teardown, and any later interpreter shutdown hang.  Uses SIGALRM+SIG_DFL so the kernel terminates the process regardless of GIL state or Python finalization.
+    # If the process exits normally before the timeout, the kernel discards the pending alarm automatically.
+    _arm_successful_shutdown_watchdog()
+    trainer.close()
+
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+        logger.info("Process group destroyed")
+
+
+if __name__ == "__main__":
+    # Read the name of the config from the environment variable, and load the config.
+    CONFIG_NAME = os.environ.get("TORCHFEATHER_CONFIG", None)
+    if CONFIG_NAME is None:
+        raise ValueError("TORCHFEATHER_CONFIG environment variable is not set")
+
+    trainer: Trainer | None = None
+    try:
+        config = get_config(CONFIG_NAME)
+        config.job.dump_folder = f"./outputs/{CONFIG_NAME}"
+        trainer = Trainer(config)
+        trainer.train()
+    except Exception:
+        if trainer:
+            trainer.close()
+        raise
+    else:
+        _shutdown_after_successful_training(trainer)

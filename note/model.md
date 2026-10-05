@@ -42,6 +42,7 @@ decode的时候只输入生成一个token的概率分布,计算量少的同时�
 $$
 \frac{1}{\text{arithmetic intensity}}=\Theta (\frac{lm^2d+md^2}{lmd^2})=\Theta (\frac{1}{l}+\frac{m}{d})
 $$
+
 我们想要让它尽可能小    
 要么增大l(batch)    
 要么增大d(token向量的维度)      
