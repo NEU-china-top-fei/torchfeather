@@ -238,6 +238,101 @@ class Trainer(Stateful):
             world_size=world_size,
         )
 
+    def batch_generator(
+        self, data_iterable: Iterable[tuple[dict[str, torch.tensor], torch.Tensor]]
+    ) -> Iterator[tuple[dict[str, torch.tensor], torch.Tensor]]:
+        device_type = device_utils.device_type
+        data_iter = iter(data_iterable)
+        while True:
+            load_time_start = time.perf_counter()
+            try:
+                batch = next(data_iter)
+            except StopIteration as ex:
+                raise DataloaderExhaustedError() from ex
+            input_dict, labels = batch
+            num_token_seen = labels.numel()
+            num_token_seen //= self.parallel_dims.cp
+            self.ntokens_seen += num_token_seen
+            self.metrics_processor.ntokens_since_last_log += num_token_seen
+            self.metrics_processor.data_loading_times.append(
+                time.perf_counter() - load_time_start
+            )
+            for k, v in input_dict.items():
+                if isinstance(v, torch.Tensor):
+                    input_dict[k] = v.to(device_type)
+            labels = labels.to(device_type)
+            yield input_dict, labels
+
+    def foward_backward_step(
+        self,
+        input_dict: dict[str, torch.tensor],
+        labels: torch.tensor,
+        global_valid_tokens: float | torch.tensor,
+    ) -> torch.tensor:
+        model_parts = self.model_parts
+        parallel_dims = self.parallel_dims
+        inputs = input_dict["input"]
+
+        extra_input = {k: v for k, v in input_dict.items() if k != "input"}
+        # arguments like casual mask
+        extra_kwargs = {}
+
+        # context parallelism
+        optional_cp_ctx = (
+            dist_utils.create_context_parallel_ctx(
+                cp_mesh=parallel_dims.get_mesh("cp"),
+                cp_buffers=cast(
+                    list[torch.tensor],
+                    [inputs, labels] + [m.freq_cis for m in model_parts],
+                ),
+                cp_seq_dims=[1, 1] + [0 for _ in model_parts],
+                cp_no_restore_buffers={inputs, labels},
+                cp_rotate_method=self.job_config.parallelism.context_parallel_rotate_method,
+                cp_load_balance=self.job_config.parallelism.context_parallel_load_balance,
+            )
+            if parallel_dims.cp_enabled
+            else None
+        )
+
+        # pipeline parallelism
+        if parallel_dims.pp_enabled:
+            # pp fwd & bwd called inside step
+            with self.train_context(optional_cp_ctx):
+                targets, loss = (labels, []) if self.pp_has_last_stage else (None, None)
+                if self.pp_has_first_stage:
+                    self.pp_schedule.step(
+                        inputs,
+                        **extra_input,
+                        **extra_kwargs,
+                        target=targets,
+                        losses=loss,
+                        return_outputs=False,
+                    )
+                else:
+                    self.pp_schedule.step(
+                        **extra_kwargs,
+                        target=targets,
+                        losses=loss,
+                        return_outputs=False,
+                    )
+            if self.pp_has_last_stage:
+                t_loss = torch.sum(torch.stack(loss)) / global_valid_tokens.to(
+                    self.device
+                )
+            else:
+                t_loss = torch.tensor([-1.0], device=self.device)
+        else:
+            with self.train_context(optional_cp_ctx):
+                assert len(self.model_parts) == 1
+                with self.maybe_enable_amp:
+                    pred = model_parts[0](inputs, **extra_input, **extra_kwargs)
+                    sum_loss = self.loss_fn(pred, labels)
+                    t_loss = sum_loss / global_valid_tokens
+                del pred
+                t_loss.backward()
+
+        return t_loss
+
     def train_step(
         self, data_iter: Iterator[tuple[dict[str, torch.tensor], torch.tensor]]
     ):
@@ -363,6 +458,22 @@ class Trainer(Stateful):
                     logger.info("Sleeping 2 seconds for other ranks to complete")
                     time.sleep(2)
                     logger.info("Training completed")
+
+    def should_continue_training(self) -> bool:
+        return self.step < self.job_config.training.steps
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"step": self.step, "ntokens_seen": self.ntokens_seen}
+
+    def load_state_dict(self, state_dict: dict[str, Any]):
+        self.step = state_dict["step"]
+        self.ntokens_seen = state_dict["ntokens_seen"]
+
+    def close(self) -> None:
+        if hasattr(self, "checkpointer") and self.checkpointer:
+            self.checkpointer.close()
+        if hasattr(self, "metrics_processor") and self.metrics_processor:
+            self.metrics_processor.close()
 
 
 def _arm_successful_shutdown_watchdog(timeout_seconds: int = 30) -> None:
