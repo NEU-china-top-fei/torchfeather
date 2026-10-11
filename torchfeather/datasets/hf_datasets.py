@@ -54,7 +54,7 @@ def _validate_dataset(
     return path, config.loader, config.sample_processor
 
 
-class HuggingFaceDateset(IterableDataset, Stateful):
+class HuggingFaceDataset(IterableDataset, Stateful):
     def __init__(
         self,
         dataset_name: str,
@@ -135,3 +135,38 @@ class HuggingFaceDateset(IterableDataset, Stateful):
         else:
             _state_dict["data"] = self._data.state_dict()
         return _state_dict
+
+
+"""
+we need parallel dataloader that prefetch data for each rank using own worker to fill the prefetch queue
+"""
+
+
+def build_hf_dataloader(
+    dp_world_size: int,
+    dp_rank: int,
+    tokenizer: DeepSeekV3Tokenizer,
+    job_config: JobConfig,
+    infinite: bool = True,
+) -> ParallelAwareDataloader:
+    dataset_name = job_config.training.dataset
+    dataset_path = job_config.training.dataset_path
+    batch_size = job_config.training.local_batch_size
+    seq_len = job_config.training.seq_len
+
+    hf_ds = HuggingFaceDataset(
+        dataset_name=dataset_name,
+        dataset_path=dataset_path,
+        tokenizer=tokenizer,
+        seq_len=seq_len,
+        dp_rank=dp_rank,
+        dp_world_size=dp_world_size,
+        infinite=infinite,
+    )
+
+    return ParallelAwareDataloader(
+        dataset=hf_ds,
+        dp_rank=dp_rank,
+        dp_world_size=dp_world_size,
+        batch_size=batch_size,
+    )
